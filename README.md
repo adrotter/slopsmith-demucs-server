@@ -6,10 +6,12 @@ A lightweight GPU-accelerated service that provides AI source separation and lyr
 
 ### Source Separation (`POST /separate`)
 
-Splits audio into individual stems using [Demucs](https://github.com/facebookresearch/demucs):
+Splits audio into individual stems using Demucs or a local UVR-compatible
+BS-RoFormer checkpoint:
 
 - Default model: **`htdemucs_ft`** (4-stem fine-tuned: drums, bass, vocals, other)
 - Other models selectable per-request: `htdemucs_6s` (6-stem incl. guitar/piano), `mdx_extra` (lighter)
+- Optional BS-RoFormer backend: 6-stem bass, drums, other, vocals, guitar, and piano output
 - File upload or URL input
 - Per-stem caching (avoids re-processing)
 - WebSocket progress updates
@@ -73,6 +75,36 @@ Options:
 - `--api-key` — optional API key for authentication
 - `--skip-warmup` — skip the startup model-weight prefetch (see below)
 
+
+### Use BS-RoFormer-SW
+
+The RoFormer backend loads UVR-compatible checkpoint and YAML files directly
+through the headless `audio-separator` package. UVR does not need to be running.
+
+The default `BS-Rofo-SW-Fixed.ckpt` and `BS-Rofo-SW-Fixed.yaml` pair can be
+downloaded from the
+[Slopsmith model mirror](https://github.com/adrotter/slopsmith-model-mirror/releases/tag/roformer-bs-rofo-sw-fixed-v1)
+into the server cache instead of committed to this repo. The mirror tracks the
+upstream [jarredou/BS-ROFO-SW-Fixed](https://huggingface.co/jarredou/BS-ROFO-SW-Fixed/tree/main)
+checkpoint:
+
+```bash
+python download_roformer.py
+```
+
+Then run with the cache-managed model:
+
+```powershell
+python server.py `
+  --model roformer `
+  --device cuda
+```
+
+On first start, warmup downloads any missing RoFormer files under
+`~/.cache/slopsmith-demucs/models/BS-ROFO-SW-Fixed/` unless
+`SLOPSMITH_DEMUCS_CACHE` points elsewhere. The `/separate` API remains unchanged
+and can request `guitar` and `piano` in addition to the four default stems.
+
 ### First-start model weight download
 
 On first start the server pre-downloads the model weights for all
@@ -80,6 +112,11 @@ three endpoints so the first user-facing request doesn't stall on a
 CDN fetch. Total download is **~1.5 GB** (htdemucs_ft, Whisper medium,
 CREPE full, English wav2vec2 aligner). Aligners for other languages
 download on the first `/align` call that uses that language.
+With the RoFormer backend, the separation warmup validates the configured local
+files, or downloads the default BS-RoFormer-SW-Fixed files first when
+`--model roformer` is used. The upstream Hugging Face model page currently
+lists the license as unknown, so this repository intentionally ships only the
+downloader and not the model files.
 
 The download runs in a background thread started from the FastAPI
 startup hook, so it fires only after the server has bound the port —

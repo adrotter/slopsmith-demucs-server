@@ -3,6 +3,7 @@ uvicorn[standard]>=0.23.0
 python-multipart>=0.0.6
 # Source separation
 demucs>=4.0.0
+audio-separator[gpu]>=0.44.2
 torch>=2.0.0
 soundfile>=0.12.0
 # Forced alignment (transcription via faster-whisper, word/char timestamps via wav2vec2)

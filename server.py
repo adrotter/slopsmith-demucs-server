@@ -36,6 +36,7 @@ import uvicorn
 from fastapi import FastAPI, File, Form, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from roformer_download import default_roformer_paths, download_roformer_files
 
 # Heavy imports happen at module top so a missing dep crashes startup
 # loudly with ModuleNotFoundError instead of silently disabling features
@@ -65,6 +66,28 @@ import whisperx
 
 DEMUCS_MODEL = os.environ.get("SLOPSMITH_DEMUCS_MODEL", "htdemucs_ft")
 DEMUCS_DEVICE = os.environ.get("SLOPSMITH_DEMUCS_DEVICE", "")
+ROFORMER_CHECKPOINT = os.environ.get("SLOPSMITH_ROFORMER_CHECKPOINT", "")
+ROFORMER_CONFIG = os.environ.get("SLOPSMITH_ROFORMER_CONFIG", "")
+ROFORMER_AUTO_DOWNLOAD = os.environ.get("SLOPSMITH_ROFORMER_AUTO_DOWNLOAD", "").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+SEPARATION_BACKEND = os.environ.get(
+    "SLOPSMITH_SEPARATION_BACKEND",
+    "roformer" if ROFORMER_AUTO_DOWNLOAD or (ROFORMER_CHECKPOINT and ROFORMER_CONFIG) else "demucs",
+).lower()
+DEFAULT_ROFORMER_MODEL_ALIASES = {
+    "roformer",
+    "reformer",
+    "bsroformer",
+    "bsroformersw",
+    "bsroformerswfixed",
+    "bsrofo",
+    "bsrofosw",
+    "bsrofoswfixed",
+}
 API_KEY = os.environ.get("SLOPSMITH_API_KEY", "")
 CACHE_DIR = Path(os.environ.get(
     "SLOPSMITH_DEMUCS_CACHE",
@@ -97,6 +120,11 @@ ws_subscribers: dict[str, set] = {}
 _model = DEMUCS_MODEL
 _device = ""
 _gpu_available = False
+_backend = SEPARATION_BACKEND
+_roformer_checkpoint = ROFORMER_CHECKPOINT
+_roformer_config = ROFORMER_CONFIG
+_roformer_auto_download = ROFORMER_AUTO_DOWNLOAD
+_roformer_download_lock = threading.Lock()
 
 # ── Warmup state ────────────────────────────────────────────────────────
 #
@@ -140,6 +168,49 @@ def _set_aligner_state(language: str, value: str) -> None:
         warmup_aligners[language] = value
     print(f"[warmup] whisperx aligner ({language}): {value}", flush=True)
 
+
+
+
+def _set_default_roformer_paths() -> None:
+    """Point RoFormer config at the cache-managed default model pair."""
+    global _roformer_checkpoint, _roformer_config
+    checkpoint, config = default_roformer_paths(CACHE_DIR)
+    _roformer_checkpoint = str(checkpoint)
+    _roformer_config = str(config)
+
+
+def _roformer_uses_default_paths() -> bool:
+    checkpoint, config = default_roformer_paths(CACHE_DIR)
+    return (
+        Path(_roformer_checkpoint).expanduser() == checkpoint.expanduser()
+        and Path(_roformer_config).expanduser() == config.expanduser()
+    )
+
+
+def _ensure_roformer_auto_downloaded() -> None:
+    """Download the cache-managed RoFormer pair when auto-download is enabled."""
+    if not _roformer_auto_download:
+        return
+    if not _roformer_checkpoint and not _roformer_config:
+        _set_default_roformer_paths()
+    if not _roformer_uses_default_paths():
+        return
+
+    with _roformer_download_lock:
+        checkpoint, config = default_roformer_paths(CACHE_DIR)
+        if (
+            checkpoint.is_file()
+            and checkpoint.stat().st_size > 0
+            and config.is_file()
+            and config.stat().st_size > 0
+        ):
+            return
+        download_roformer_files(CACHE_DIR)
+
+
+def _is_default_roformer_model_name(model: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "", (model or "").lower())
+    return normalized in DEFAULT_ROFORMER_MODEL_ALIASES
 
 # ── Auth middleware ─────────────────────────────────────────────────────
 
@@ -198,6 +269,8 @@ def health():
     return {
         "status": "ok",
         "demucs_model": _model,
+        "separation_backend": _backend,
+        "separation_model": _separation_model_label(_model),
         "gpu": _gpu_available,
         "device": _device,
         "cache_dir": str(CACHE_DIR),
@@ -1382,10 +1455,25 @@ async def ws_job_progress(websocket: WebSocket, job_id: str):
 
 # ── Internal helpers ────────────────────────────────────────────────────
 
+def _separation_model_label(model):
+    """Return the user-visible model identifier for the configured backend."""
+    if _backend == "roformer":
+        return Path(_roformer_checkpoint).stem
+    return model
+
+
+def _cache_identity(model):
+    """Keep cached stems isolated by backend and model."""
+    return f"{_backend}:{_separation_model_label(model)}"
+
+
 def _check_cache(job_id, stem_list, model):
     """Return stem download URLs if all requested stems are cached."""
     cache_path = CACHE_DIR / job_id
     if not cache_path.exists():
+        return None
+    identity_path = cache_path / ".model"
+    if not identity_path.exists() or identity_path.read_text(encoding="utf-8") != _cache_identity(model):
         return None
 
     stems_found = {}
@@ -1401,6 +1489,19 @@ def _check_cache(job_id, stem_list, model):
     return None
 
 
+def _prepare_cache_path(job_id, model):
+    """Create an empty cache directory when the backend or model changed."""
+    cache_path = CACHE_DIR / job_id
+    identity_path = cache_path / ".model"
+    if cache_path.exists() and (
+        not identity_path.exists()
+        or identity_path.read_text(encoding="utf-8") != _cache_identity(model)
+    ):
+        shutil.rmtree(cache_path, ignore_errors=True)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    return cache_path
+
+
 def _enqueue_job(job_id, audio_path, stem_list, model):
     """Create a job and start processing in background."""
     global active_count
@@ -1408,14 +1509,19 @@ def _enqueue_job(job_id, audio_path, stem_list, model):
     with jobs_lock:
         # If job already exists and is processing/complete, return it
         existing = jobs.get(job_id)
-        if existing and existing["status"] in ("processing", "complete"):
+        if (
+            existing
+            and existing.get("backend") == _backend
+            and existing.get("model") == _separation_model_label(model)
+            and existing["status"] in ("processing", "complete")
+        ):
             if existing["status"] == "complete":
                 return {"job_id": job_id, "stems": existing["stems"], "cached": True}
             return {"job_id": job_id, "status": "processing"}
 
     with active_lock:
         if active_count >= MAX_CONCURRENT:
-            return {"error": "Server busy — max concurrent separations reached", "job_id": job_id}
+            return {"error": "Server busy ? max concurrent separations reached", "job_id": job_id}
 
     job = {
         "job_id": job_id,
@@ -1423,7 +1529,8 @@ def _enqueue_job(job_id, audio_path, stem_list, model):
         "progress": 0,
         "stems": {},
         "error": None,
-        "model": model,
+        "backend": _backend,
+        "model": _separation_model_label(model),
         "created_at": time.time(),
     }
     with jobs_lock:
@@ -1433,7 +1540,7 @@ def _enqueue_job(job_id, audio_path, stem_list, model):
             jobs.popitem(last=False)
 
     thread = threading.Thread(
-        target=_run_demucs,
+        target=_run_separation,
         args=(job_id, audio_path, stem_list, model),
         daemon=True,
     )
@@ -1442,25 +1549,41 @@ def _enqueue_job(job_id, audio_path, stem_list, model):
     return {"job_id": job_id, "status": "processing"}
 
 
-def _run_demucs(job_id, audio_path, stem_list, model):
-    """Run demucs separation in a background thread."""
+def _run_separation(job_id, audio_path, stem_list, model):
+    """Run the configured source separation backend in a background thread."""
     global active_count
 
     with active_lock:
         active_count += 1
 
-    tmp_out = tempfile.mkdtemp(prefix="demucs_out_")
+    tmp_out = tempfile.mkdtemp(prefix=f"{_backend}_out_")
     try:
         _update_job(job_id, status="processing", progress=10)
 
-        # Build demucs command
-        run_demucs = str(Path(__file__).parent / "run_demucs.py")
-        cmd = [sys.executable, run_demucs, "--shifts", "2"]
-        if model:
-            cmd.extend(["-n", model])
-        if _device:
-            cmd.extend(["-d", _device])
-        cmd.extend(["-o", tmp_out, audio_path])
+        if _backend == "roformer":
+            _ensure_roformer_auto_downloaded()
+            run_roformer = str(Path(__file__).parent / "run_roformer.py")
+            cmd = [
+                sys.executable,
+                run_roformer,
+                "--checkpoint",
+                _roformer_checkpoint,
+                "--config",
+                _roformer_config,
+                "--output-dir",
+                tmp_out,
+            ]
+            if _device:
+                cmd.extend(["--device", _device])
+            cmd.append(audio_path)
+        else:
+            run_demucs = str(Path(__file__).parent / "run_demucs.py")
+            cmd = [sys.executable, run_demucs, "--shifts", "2"]
+            if model:
+                cmd.extend(["-n", model])
+            if _device:
+                cmd.extend(["-d", _device])
+            cmd.extend(["-o", tmp_out, audio_path])
 
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -1471,36 +1594,34 @@ def _run_demucs(job_id, audio_path, stem_list, model):
         _, stderr = proc.communicate(timeout=600)
 
         if proc.returncode != 0:
-            # Strip tqdm progress bars — real errors are at the end
+            # Strip tqdm progress bars ? real errors are at the end
             err_lines = [l for l in stderr.splitlines() if l and '%|' not in l and 'B/s]' not in l]
             err_msg = '\n'.join(err_lines[-20:]) if err_lines else stderr[-1000:]
             _update_job(job_id, status="failed", error=err_msg[:1000])
             return
 
         # First successful demucs run implies the model weights are
-        # loaded — flip /health.warmup.demucs to ready for the
+        # loaded ? flip /health.warmup.demucs to ready for the
         # lazy-load (--skip-warmup or post-warmup-failure) path.
         _mark_lazy_loaded("demucs")
         _update_job(job_id, progress=80)
 
-        # Find output stems
-        # Demucs outputs to: {out_dir}/{model}/{track_name}/{stem}.wav
-        audio_stem = Path(audio_path).stem
-        out_model_dir = Path(tmp_out) / model
-        if not out_model_dir.exists():
-            # Try finding any model directory
-            subdirs = list(Path(tmp_out).iterdir())
-            out_model_dir = subdirs[0] if subdirs else Path(tmp_out)
+        # Demucs nests stems by model and track; RoFormer writes directly.
+        out_track_dir = Path(tmp_out)
+        if _backend == "demucs":
+            audio_stem = Path(audio_path).stem
+            out_model_dir = Path(tmp_out) / model
+            if not out_model_dir.exists():
+                subdirs = list(Path(tmp_out).iterdir())
+                out_model_dir = subdirs[0] if subdirs else Path(tmp_out)
 
-        out_track_dir = out_model_dir / audio_stem
-        if not out_track_dir.exists():
-            # Try finding any track directory
-            subdirs = list(out_model_dir.iterdir())
-            out_track_dir = subdirs[0] if subdirs else out_model_dir
+            out_track_dir = out_model_dir / audio_stem
+            if not out_track_dir.exists():
+                subdirs = list(out_model_dir.iterdir())
+                out_track_dir = subdirs[0] if subdirs else out_model_dir
 
-        # Copy stems to cache — keep as lossless WAV for quality
-        cache_path = CACHE_DIR / job_id
-        cache_path.mkdir(parents=True, exist_ok=True)
+        # Copy stems to cache ? keep as lossless WAV for quality
+        cache_path = _prepare_cache_path(job_id, model)
 
         stems_result = {}
         for stem_name in stem_list:
@@ -1512,6 +1633,8 @@ def _run_demucs(job_id, audio_path, stem_list, model):
             shutil.copy2(src, wav_dest)
             stems_result[stem_name] = f"/download/{job_id}/{stem_name}.wav"
 
+        if stems_result:
+            (cache_path / ".model").write_text(_cache_identity(model), encoding="utf-8")
         _update_job(job_id, status="complete", progress=100, stems=stems_result)
 
     except subprocess.TimeoutExpired:
@@ -1528,7 +1651,6 @@ def _run_demucs(job_id, audio_path, stem_list, model):
             os.unlink(audio_path)
         except OSError:
             pass
-
 
 def _update_job(job_id, **kwargs):
     """Update job state and notify WebSocket subscribers."""
@@ -1581,6 +1703,24 @@ def _warmup_demucs() -> None:
     run_demucs.py with --download-only, which calls
     demucs.pretrained.get_model() to trigger the torch.hub weight
     download and then exits (no audio separation is performed)."""
+    if _backend == "roformer":
+        _set_warmup_state("demucs", "downloading")
+        try:
+            _ensure_roformer_auto_downloaded()
+        except Exception as exc:  # noqa: BLE001
+            _set_warmup_state("demucs", f"failed: {exc}")
+            return
+        missing = [
+            path
+            for path in (_roformer_checkpoint, _roformer_config)
+            if not Path(path).is_file()
+        ]
+        if missing:
+            _set_warmup_state("demucs", f"failed: missing local model file: {missing[0]}")
+        else:
+            _set_warmup_state("demucs", "ready")
+        return
+
     _set_warmup_state("demucs", "downloading")
     run_demucs = str(Path(__file__).parent / "run_demucs.py")
     cmd = [sys.executable, run_demucs, "--download-only"]
@@ -1636,13 +1776,15 @@ def _run_warmup() -> None:
 # ── CLI entry point ─────────────────────────────────────────────────────
 
 def main():
-    global _model, _device, _gpu_available, API_KEY
+    global _model, _device, _gpu_available, _backend, _roformer_checkpoint, _roformer_config
+    global _roformer_auto_download, API_KEY
 
     parser = argparse.ArgumentParser(description="Slopsmith Demucs Separation Service")
     parser.add_argument("--port", type=int, default=7865, help="Port to listen on")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
-    parser.add_argument("--model", default="", help="Demucs model (htdemucs, mdx_extra)")
+    parser.add_argument("--model", default="", help="Demucs model, or roformer for the default BS-RoFormer model")
     parser.add_argument("--device", default="", help="Device (cpu, cuda)")
+    parser.add_argument("--backend", choices=("demucs", "roformer"), default="", help="Source separation backend")
     parser.add_argument("--api-key", default="", help="API key for auth")
     parser.add_argument(
         "--skip-warmup",
@@ -1652,12 +1794,41 @@ def main():
     )
     args = parser.parse_args()
 
+    model_selects_roformer = _is_default_roformer_model_name(args.model)
+    if model_selects_roformer and args.backend == "demucs":
+        parser.error("--model roformer cannot be combined with --backend demucs")
     if args.model:
-        _model = args.model
+        if model_selects_roformer:
+            _backend = "roformer"
+            _roformer_auto_download = True
+        else:
+            _model = args.model
     if args.device:
         _device = args.device
+    if args.backend:
+        _backend = args.backend
+    if args.backend == "roformer" and not _roformer_checkpoint and not _roformer_config:
+        _roformer_auto_download = True
+    if not args.backend and _roformer_auto_download:
+        _backend = "roformer"
     if args.api_key:
         API_KEY = args.api_key
+
+    if _backend not in ("demucs", "roformer"):
+        parser.error("source separation backend must be demucs or roformer")
+    if _backend == "roformer":
+        if _roformer_auto_download and not _roformer_checkpoint and not _roformer_config:
+            _set_default_roformer_paths()
+        if bool(_roformer_checkpoint) != bool(_roformer_config):
+            parser.error("SLOPSMITH_ROFORMER_CHECKPOINT and SLOPSMITH_ROFORMER_CONFIG must be set together")
+        if not _roformer_checkpoint or not _roformer_config:
+            _roformer_auto_download = True
+            _set_default_roformer_paths()
+        if not _roformer_auto_download or not _roformer_uses_default_paths():
+            if not Path(_roformer_checkpoint).is_file():
+                parser.error("SLOPSMITH_ROFORMER_CHECKPOINT must point to an existing file")
+            if not Path(_roformer_config).is_file():
+                parser.error("SLOPSMITH_ROFORMER_CONFIG must point to an existing file")
 
     _gpu_available = _detect_gpu()
     if not _device:
@@ -1666,7 +1837,12 @@ def main():
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     print(f"Slopsmith Demucs Server starting on {args.host}:{args.port}")
-    print(f"  Model: {_model}")
+    print(f"  Separation backend: {_backend}")
+    print(f"  Separation model: {_separation_model_label(_model)}")
+    if _backend == "roformer":
+        print(f"  RoFormer auto-download: {_roformer_auto_download}")
+        print(f"  RoFormer checkpoint: {_roformer_checkpoint}")
+        print(f"  RoFormer config: {_roformer_config}")
     print(f"  Device: {_device} (GPU: {_gpu_available})")
     print(f"  Cache: {CACHE_DIR}")
     if API_KEY:
