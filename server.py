@@ -1713,7 +1713,7 @@ def _warmup_demucs() -> None:
         missing = [
             path
             for path in (_roformer_checkpoint, _roformer_config)
-            if not Path(path).is_file()
+            if not Path(path).is_file() or Path(path).stat().st_size == 0
         ]
         if missing:
             _set_warmup_state("demucs", f"failed: missing local model file: {missing[0]}")

@@ -73,11 +73,42 @@ def _existing_file(value: str) -> Path:
 def _pad_short_audio(audio_path: Path, config_path: Path):
     """Pad clips shorter than one model window; audio-separator cannot."""
     with config_path.open(encoding="utf-8") as config_file:
-        config = yaml.load(config_file, Loader=yaml.FullLoader)
+        config = yaml.safe_load(config_file)
 
-    sample_rate = int(config["audio"]["sample_rate"])
-    hop_length = int(config["model"].get("stft_hop_length", config["audio"]["hop_length"]))
-    minimum_samples = hop_length * (int(config["inference"]["dim_t"]) - 1)
+    if not isinstance(config, dict):
+        raise ValueError(f"RoFormer config must be a YAML mapping: {config_path}")
+    audio_config = config.get("audio")
+    model_config = config.get("model") or {}
+    inference_config = config.get("inference")
+    missing = []
+    if not isinstance(audio_config, dict):
+        missing.append("audio")
+    else:
+        if "sample_rate" not in audio_config:
+            missing.append("audio.sample_rate")
+    if not isinstance(model_config, dict):
+        missing.append("model")
+        model_config = {}
+    if not isinstance(inference_config, dict):
+        missing.append("inference")
+    elif "dim_t" not in inference_config:
+        missing.append("inference.dim_t")
+    if (
+        isinstance(audio_config, dict)
+        and "hop_length" not in audio_config
+        and "stft_hop_length" not in model_config
+    ):
+        missing.append("audio.hop_length or model.stft_hop_length")
+    if missing:
+        raise ValueError(f"RoFormer config is missing required key(s): {', '.join(missing)}")
+
+    sample_rate = int(audio_config["sample_rate"])
+    hop_length = int(
+        model_config["stft_hop_length"]
+        if "stft_hop_length" in model_config
+        else audio_config["hop_length"]
+    )
+    minimum_samples = hop_length * (int(inference_config["dim_t"]) - 1)
     if librosa.get_duration(path=str(audio_path)) >= minimum_samples / sample_rate:
         return audio_path, None, None
 

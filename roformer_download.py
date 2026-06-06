@@ -14,6 +14,8 @@ ROFORMER_CHECKPOINT_FILENAME = "BS-Rofo-SW-Fixed.ckpt"
 ROFORMER_CONFIG_FILENAME = "BS-Rofo-SW-Fixed.yaml"
 ROFORMER_FILES = (ROFORMER_CHECKPOINT_FILENAME, ROFORMER_CONFIG_FILENAME)
 USER_AGENT = "slopsmith-demucs-server/roformer-downloader"
+TIMEOUT = 60
+CHUNK_SIZE = 8192
 
 
 def default_roformer_dir(cache_dir: Path) -> Path:
@@ -52,8 +54,12 @@ def _download_file(filename: str, destination: Path, force: bool = False) -> Non
 
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(request) as response, partial.open("wb") as output:
-            output.write(response.read())
+        with (
+            urllib.request.urlopen(request, timeout=TIMEOUT) as response,
+            partial.open("wb") as output,
+        ):
+            while chunk := response.read(CHUNK_SIZE):
+                output.write(chunk)
         partial.replace(destination)
     except Exception as exc:
         if partial.exists():

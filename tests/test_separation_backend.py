@@ -154,13 +154,14 @@ class SeparationBackendTests(unittest.TestCase):
 
             class FakeResponse:
                 def __enter__(self):
+                    self.chunks = [b"model", b""]
                     return self
 
                 def __exit__(self, exc_type, exc, traceback):
                     return False
 
-                def read(self):
-                    return b"model"
+                def read(self, size=-1):
+                    return self.chunks.pop(0)
 
             with patch("roformer_download.urllib.request.urlopen", return_value=FakeResponse()) as download:
                 checkpoint, config = roformer_download.download_roformer_files(root)
@@ -172,6 +173,26 @@ class SeparationBackendTests(unittest.TestCase):
             self.assertEqual(
                 first_url,
                 f"{roformer_download.ROFORMER_MIRROR_BASE_URL}/{roformer_download.ROFORMER_CHECKPOINT_FILENAME}",
+            )
+            self.assertEqual(download.call_args_list[0].kwargs["timeout"], roformer_download.TIMEOUT)
+
+    def test_roformer_warmup_rejects_zero_byte_local_model_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            checkpoint = root / "model.ckpt"
+            config = root / "model.yaml"
+            checkpoint.write_bytes(b"")
+            config.write_text("audio: {}", encoding="utf-8")
+            server._backend = "roformer"
+            server._roformer_auto_download = False
+            server._roformer_checkpoint = str(checkpoint)
+            server._roformer_config = str(config)
+
+            server._warmup_demucs()
+
+            self.assertEqual(
+                server.warmup_state["demucs"],
+                f"failed: missing local model file: {checkpoint}",
             )
 
     def test_cli_model_roformer_selects_auto_download_backend(self):
