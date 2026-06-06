@@ -61,6 +61,18 @@ import torchcrepe
 import librosa
 import whisperx
 
+DEFAULT_CACHE_MAX_COMPLETED_JOBS = 10
+CACHE_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _parse_cache_max_completed_jobs(value: str | None) -> int:
+    """Parse cache capacity from env, falling back to a safe bounded default."""
+    try:
+        parsed = int(value) if value is not None else DEFAULT_CACHE_MAX_COMPLETED_JOBS
+    except (TypeError, ValueError):
+        return DEFAULT_CACHE_MAX_COMPLETED_JOBS
+    return max(1, parsed)
+
 # ── Configuration ───────────────────────────────────────────────────────
 
 DEMUCS_MODEL = os.environ.get("SLOPSMITH_DEMUCS_MODEL", "htdemucs_ft")
@@ -71,7 +83,9 @@ CACHE_DIR = Path(os.environ.get(
     Path.home() / ".cache" / "slopsmith-demucs",
 ))
 MAX_CONCURRENT = 2
-CACHE_MAX_COMPLETED_JOBS = int(os.environ.get("SLOPSMITH_DEMUCS_CACHE_MAX_JOBS", "10"))
+CACHE_MAX_COMPLETED_JOBS = _parse_cache_max_completed_jobs(
+    os.environ.get("SLOPSMITH_DEMUCS_CACHE_MAX_JOBS")
+)
 
 # ── State ───────────────────────────────────────────────────────────────
 
@@ -1318,12 +1332,17 @@ async def pitch_extract(
 
 @app.get("/download/{job_id}/{stem}")
 def download_stem(job_id: str, stem: str):
+    try:
+        cache_path = _cache_entry_path(job_id)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, 400)
+
     # stem can be "drums.mp3", "drums.wav", or just "drums"
     stem_name = Path(stem).stem
 
     # Try multiple extensions
     for ext in (".mp3", ".wav", ".flac"):
-        path = CACHE_DIR / job_id / f"{stem_name}{ext}"
+        path = cache_path / f"{stem_name}{ext}"
         if path.exists():
             media = {"mp3": "audio/mpeg", "wav": "audio/wav", "flac": "audio/flac"}
             return FileResponse(str(path), media_type=media.get(ext[1:], "application/octet-stream"))
@@ -1352,7 +1371,10 @@ def get_job(job_id: str):
 
 @app.delete("/cache/{job_id}")
 def delete_cache(job_id: str):
-    _delete_cache_entry(job_id)
+    try:
+        _delete_cache_entry(job_id)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, 400)
     with jobs_lock:
         jobs.pop(job_id, None)
     return {"ok": True}
@@ -1383,9 +1405,30 @@ async def ws_job_progress(websocket: WebSocket, job_id: str):
 
 # ── Internal helpers ────────────────────────────────────────────────────
 
+def _cache_entry_path(job_id: str) -> Path:
+    """Return a resolved cache entry path for a safe single-segment job id."""
+    if (
+        not isinstance(job_id, str)
+        or not CACHE_JOB_ID_RE.fullmatch(job_id)
+        or job_id in (".", "..")
+    ):
+        raise ValueError("Invalid job_id")
+
+    cache_root = CACHE_DIR.resolve()
+    cache_path = (cache_root / job_id).resolve()
+    try:
+        cache_path.relative_to(cache_root)
+    except ValueError as exc:
+        raise ValueError("Invalid job_id") from exc
+    return cache_path
+
+
 def _check_cache(job_id, stem_list, model):
     """Return stem download URLs if all requested stems are cached."""
-    cache_path = CACHE_DIR / job_id
+    try:
+        cache_path = _cache_entry_path(job_id)
+    except ValueError:
+        return None
     if not cache_path.exists():
         return None
 
@@ -1405,7 +1448,7 @@ def _check_cache(job_id, stem_list, model):
 
 def _delete_cache_entry(job_id):
     """Delete one completed separation cache entry."""
-    cache_path = CACHE_DIR / job_id
+    cache_path = _cache_entry_path(job_id)
     if cache_path.exists():
         shutil.rmtree(cache_path, ignore_errors=True)
     with cache_order_lock:
@@ -1418,6 +1461,7 @@ def _delete_cache_entry(job_id):
 def _remember_cache_entry(job_id):
     """Track the newest completed cache entries and evict older ones."""
     evicted = []
+    _cache_entry_path(job_id)
     with cache_order_lock:
         try:
             cache_order.remove(job_id)
@@ -1425,11 +1469,15 @@ def _remember_cache_entry(job_id):
             pass
         cache_order.append(job_id)
 
-        while CACHE_MAX_COMPLETED_JOBS >= 0 and len(cache_order) > CACHE_MAX_COMPLETED_JOBS:
+        while len(cache_order) > CACHE_MAX_COMPLETED_JOBS:
             evicted.append(cache_order.popleft())
 
     for old_job_id in evicted:
-        shutil.rmtree(CACHE_DIR / old_job_id, ignore_errors=True)
+        try:
+            old_cache_path = _cache_entry_path(old_job_id)
+        except ValueError:
+            continue
+        shutil.rmtree(old_cache_path, ignore_errors=True)
         with jobs_lock:
             jobs.pop(old_job_id, None)
 
@@ -1437,11 +1485,12 @@ def _remember_cache_entry(job_id):
 def _initialize_cache_order():
     """Seed the bounded cache queue from existing cache folders at startup."""
     cache_entries = []
-    if CACHE_MAX_COMPLETED_JOBS < 0:
-        return
-
     for path in CACHE_DIR.iterdir():
         if path.is_dir():
+            try:
+                _cache_entry_path(path.name)
+            except ValueError:
+                continue
             cache_entries.append((path.stat().st_mtime, path.name))
 
     for _, job_id in sorted(cache_entries):
@@ -1546,7 +1595,7 @@ def _run_demucs(job_id, audio_path, stem_list, model):
             out_track_dir = subdirs[0] if subdirs else out_model_dir
 
         # Copy stems to cache — keep as lossless WAV for quality
-        cache_path = CACHE_DIR / job_id
+        cache_path = _cache_entry_path(job_id)
         cache_path.mkdir(parents=True, exist_ok=True)
 
         stems_result = {}
