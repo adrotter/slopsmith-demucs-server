@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import socket
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -14,8 +17,9 @@ ROFORMER_CHECKPOINT_FILENAME = "BS-Rofo-SW-Fixed.ckpt"
 ROFORMER_CONFIG_FILENAME = "BS-Rofo-SW-Fixed.yaml"
 ROFORMER_FILES = (ROFORMER_CHECKPOINT_FILENAME, ROFORMER_CONFIG_FILENAME)
 USER_AGENT = "slopsmith-demucs-server/roformer-downloader"
-TIMEOUT = 60
+TIMEOUT = 600
 CHUNK_SIZE = 8192
+MIN_DOWNLOAD_RATE_BYTES_PER_SECOND = 64 * 1024
 
 
 def default_roformer_dir(cache_dir: Path) -> Path:
@@ -58,11 +62,44 @@ def _download_file(filename: str, destination: Path, force: bool = False) -> Non
             urllib.request.urlopen(request, timeout=TIMEOUT) as response,
             partial.open("wb") as output,
         ):
+            expected_total = _content_length(response)
+            deadline_seconds = _download_deadline_seconds(expected_total)
+            started = time.monotonic()
+            downloaded = 0
             while chunk := response.read(CHUNK_SIZE):
                 output.write(chunk)
+                downloaded += len(chunk)
+                elapsed = time.monotonic() - started
+                if elapsed > deadline_seconds:
+                    raise TimeoutError(
+                        f"download exceeded {deadline_seconds:.0f}s deadline after "
+                        f"{elapsed:.0f}s ({downloaded}/{expected_total or 'unknown'} bytes)"
+                    )
         partial.replace(destination)
+    except (socket.timeout, urllib.error.URLError) as exc:
+        print(f"[roformer] failed {destination.name}: {exc}", flush=True)
+        if partial.exists():
+            partial.unlink()
+        raise RuntimeError(f"failed to download {filename} from {url}: {exc}") from exc
     except Exception as exc:
         if partial.exists():
             partial.unlink()
         raise RuntimeError(f"failed to download {filename} from {url}: {exc}") from exc
     print(f"[roformer] ready {destination}", flush=True)
+
+
+def _content_length(response) -> int | None:
+    value = response.getheader("Content-Length")
+    if not value:
+        return None
+    try:
+        total = int(value)
+    except ValueError:
+        return None
+    return total if total > 0 else None
+
+
+def _download_deadline_seconds(expected_total: int | None) -> float:
+    if expected_total is None:
+        return float(TIMEOUT)
+    return max(float(TIMEOUT), expected_total / MIN_DOWNLOAD_RATE_BYTES_PER_SECOND)

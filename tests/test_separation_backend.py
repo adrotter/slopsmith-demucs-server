@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -163,6 +164,9 @@ class SeparationBackendTests(unittest.TestCase):
                 def read(self, size=-1):
                     return self.chunks.pop(0)
 
+                def getheader(self, name):
+                    return "5" if name == "Content-Length" else None
+
             with patch("roformer_download.urllib.request.urlopen", return_value=FakeResponse()) as download:
                 checkpoint, config = roformer_download.download_roformer_files(root)
 
@@ -175,6 +179,47 @@ class SeparationBackendTests(unittest.TestCase):
                 f"{roformer_download.ROFORMER_MIRROR_BASE_URL}/{roformer_download.ROFORMER_CHECKPOINT_FILENAME}",
             )
             self.assertEqual(download.call_args_list[0].kwargs["timeout"], roformer_download.TIMEOUT)
+
+    def test_roformer_downloader_aborts_when_overall_deadline_expires(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            class FakeResponse:
+                def __enter__(self):
+                    self.chunks = [b"model", b""]
+                    return self
+
+                def __exit__(self, exc_type, exc, traceback):
+                    return False
+
+                def read(self, size=-1):
+                    return self.chunks.pop(0)
+
+                def getheader(self, name):
+                    return "1" if name == "Content-Length" else None
+
+            with (
+                patch("roformer_download.TIMEOUT", 1),
+                patch("roformer_download.time.monotonic", side_effect=[0.0, 2.0]),
+                patch("roformer_download.urllib.request.urlopen", return_value=FakeResponse()),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "download exceeded 1s deadline"):
+                    roformer_download.download_roformer_files(root)
+
+    def test_roformer_downloader_logs_url_errors(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            with (
+                patch("roformer_download.urllib.request.urlopen", side_effect=urllib.error.URLError("offline")),
+                patch("builtins.print") as log,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "offline"):
+                    roformer_download.download_roformer_files(root)
+
+            self.assertTrue(
+                any("failed BS-Rofo-SW-Fixed.ckpt" in str(call) for call in log.call_args_list)
+            )
 
     def test_roformer_warmup_rejects_zero_byte_local_model_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
