@@ -10,6 +10,9 @@ import server
 import roformer_download
 
 
+MODEL_SHA256 = "9372c470eeadd5ecd9c3c74c2b3cb633f8e2f2fad799250a0f70d652b6b825e4"
+
+
 class FakeProcess:
     returncode = 0
     command = None
@@ -168,7 +171,14 @@ class SeparationBackendTests(unittest.TestCase):
                     return "5" if name == "Content-Length" else None
 
             with patch("roformer_download.urllib.request.urlopen", return_value=FakeResponse()) as download:
-                checkpoint, config = roformer_download.download_roformer_files(root)
+                with patch.dict(
+                    roformer_download.ROFORMER_SHA256,
+                    {
+                        roformer_download.ROFORMER_CHECKPOINT_FILENAME: MODEL_SHA256,
+                        roformer_download.ROFORMER_CONFIG_FILENAME: MODEL_SHA256,
+                    },
+                ):
+                    checkpoint, config = roformer_download.download_roformer_files(root)
 
             self.assertEqual(checkpoint.name, roformer_download.ROFORMER_CHECKPOINT_FILENAME)
             self.assertEqual(config.name, roformer_download.ROFORMER_CONFIG_FILENAME)
@@ -179,6 +189,99 @@ class SeparationBackendTests(unittest.TestCase):
                 f"{roformer_download.ROFORMER_MIRROR_BASE_URL}/{roformer_download.ROFORMER_CHECKPOINT_FILENAME}",
             )
             self.assertEqual(download.call_args_list[0].kwargs["timeout"], roformer_download.TIMEOUT)
+
+    def test_roformer_downloader_skips_cache_only_when_checksum_matches(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            checkpoint, _ = roformer_download.default_roformer_paths(root)
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_bytes(b"model")
+
+            with (
+                patch(
+                    "roformer_download.ROFORMER_FILES",
+                    (roformer_download.ROFORMER_CHECKPOINT_FILENAME,),
+                ),
+                patch.dict(
+                    roformer_download.ROFORMER_SHA256,
+                    {roformer_download.ROFORMER_CHECKPOINT_FILENAME: MODEL_SHA256},
+                ),
+                patch("roformer_download.urllib.request.urlopen") as download,
+            ):
+                roformer_download.download_roformer_files(root)
+
+            download.assert_not_called()
+
+    def test_roformer_downloader_refetches_cache_when_checksum_mismatches(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            checkpoint, _ = roformer_download.default_roformer_paths(root)
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_bytes(b"bad")
+
+            class FakeResponse:
+                def __enter__(self):
+                    self.chunks = [b"model", b""]
+                    return self
+
+                def __exit__(self, exc_type, exc, traceback):
+                    return False
+
+                def read(self, size=-1):
+                    return self.chunks.pop(0)
+
+                def getheader(self, name):
+                    return "5" if name == "Content-Length" else None
+
+            with (
+                patch(
+                    "roformer_download.ROFORMER_FILES",
+                    (roformer_download.ROFORMER_CHECKPOINT_FILENAME,),
+                ),
+                patch.dict(
+                    roformer_download.ROFORMER_SHA256,
+                    {roformer_download.ROFORMER_CHECKPOINT_FILENAME: MODEL_SHA256},
+                ),
+                patch("roformer_download.urllib.request.urlopen", return_value=FakeResponse()) as download,
+            ):
+                roformer_download.download_roformer_files(root)
+
+            download.assert_called_once()
+            self.assertEqual(checkpoint.read_bytes(), b"model")
+
+    def test_roformer_downloader_uses_unique_temp_file_and_cleans_only_its_own(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            checkpoint, _ = roformer_download.default_roformer_paths(root)
+            checkpoint.parent.mkdir(parents=True)
+            shared_partial = checkpoint.with_suffix(checkpoint.suffix + ".part")
+            shared_partial.write_bytes(b"other process")
+
+            class FakeResponse:
+                def __enter__(self):
+                    self.chunks = [b"bad", b""]
+                    return self
+
+                def __exit__(self, exc_type, exc, traceback):
+                    return False
+
+                def read(self, size=-1):
+                    return self.chunks.pop(0)
+
+                def getheader(self, name):
+                    return "3" if name == "Content-Length" else None
+
+            with patch("roformer_download.urllib.request.urlopen", return_value=FakeResponse()):
+                with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
+                    roformer_download._download_file(
+                        roformer_download.ROFORMER_CHECKPOINT_FILENAME,
+                        checkpoint,
+                        MODEL_SHA256,
+                    )
+
+            self.assertTrue(shared_partial.exists())
+            self.assertEqual(shared_partial.read_bytes(), b"other process")
+            self.assertEqual(list(checkpoint.parent.glob(f"{checkpoint.name}.*.part")), [])
 
     def test_roformer_downloader_aborts_when_overall_deadline_expires(self):
         with tempfile.TemporaryDirectory() as temp_dir:
