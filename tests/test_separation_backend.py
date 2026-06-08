@@ -40,20 +40,29 @@ class SeparationBackendTests(unittest.TestCase):
             "_roformer_config": server._roformer_config,
             "_roformer_auto_download": server._roformer_auto_download,
             "CACHE_DIR": server.CACHE_DIR,
+            "CACHE_MAX_COMPLETED_JOBS": server.CACHE_MAX_COMPLETED_JOBS,
+            "cache_order": list(server.cache_order),
             "warmup_state": dict(server.warmup_state),
         }
         with server.jobs_lock:
             server.jobs.clear()
+        with server.cache_order_lock:
+            server.cache_order.clear()
 
     def tearDown(self):
         for name, value in self.originals.items():
             if name == "warmup_state":
                 server.warmup_state.clear()
                 server.warmup_state.update(value)
+            elif name == "cache_order":
+                continue
             else:
                 setattr(server, name, value)
         with server.jobs_lock:
             server.jobs.clear()
+        with server.cache_order_lock:
+            server.cache_order.clear()
+            server.cache_order.extend(self.originals["cache_order"])
 
     def test_cache_entries_are_isolated_by_backend_and_model(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -75,6 +84,30 @@ class SeparationBackendTests(unittest.TestCase):
             prepared_path = server._prepare_cache_path("job", "htdemucs_ft")
             self.assertEqual(prepared_path, cache_path)
             self.assertFalse((cache_path / "vocals.wav").exists())
+
+    def test_cache_eviction_ignores_roformer_model_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            server.CACHE_DIR = Path(temp_dir)
+            server.CACHE_MAX_COMPLETED_JOBS = 1
+            models_dir = server.CACHE_DIR / "models"
+            models_dir.mkdir()
+            (models_dir / "BS-Rofo-SW-Fixed.ckpt").write_bytes(b"model")
+
+            old_cache = server.CACHE_DIR / "old"
+            old_cache.mkdir()
+            (old_cache / ".model").write_text("demucs:htdemucs_ft", encoding="utf-8")
+            (old_cache / "vocals.wav").write_bytes(b"stem")
+
+            new_cache = server.CACHE_DIR / "new"
+            new_cache.mkdir()
+            (new_cache / ".model").write_text("demucs:htdemucs_ft", encoding="utf-8")
+
+            server._initialize_cache_order()
+            server._remember_cache_entry("new")
+
+            self.assertTrue(models_dir.exists())
+            self.assertFalse(old_cache.exists())
+            self.assertTrue(new_cache.exists())
 
     def test_roformer_worker_invokes_local_runner_and_caches_requested_stems(self):
         with tempfile.TemporaryDirectory() as temp_dir:

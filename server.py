@@ -1574,12 +1574,13 @@ def _initialize_cache_order():
     """Seed the bounded cache queue from existing cache folders at startup."""
     cache_entries = []
     for path in CACHE_DIR.iterdir():
-        if path.is_dir():
-            try:
-                _cache_entry_path(path.name)
-            except ValueError:
-                continue
-            cache_entries.append((path.stat().st_mtime, path.name))
+        if not path.is_dir() or not (path / ".model").is_file():
+            continue
+        try:
+            _cache_entry_path(path.name)
+        except ValueError:
+            continue
+        cache_entries.append((path.stat().st_mtime, path.name))
 
     for _, job_id in sorted(cache_entries):
         _remember_cache_entry(job_id)
@@ -1587,7 +1588,7 @@ def _initialize_cache_order():
 
 def _prepare_cache_path(job_id, model):
     """Create an empty cache directory when the backend or model changed."""
-    cache_path = CACHE_DIR / job_id
+    cache_path = _cache_entry_path(job_id)
     identity_path = cache_path / ".model"
     if cache_path.exists() and (
         not identity_path.exists()
@@ -1717,9 +1718,6 @@ def _run_separation(job_id, audio_path, stem_list, model):
                 out_track_dir = subdirs[0] if subdirs else out_model_dir
 
         # Copy stems to cache — keep as lossless WAV for quality
-        cache_path = _cache_entry_path(job_id)
-        cache_path.mkdir(parents=True, exist_ok=True)
-        # Copy stems to cache ? keep as lossless WAV for quality
         cache_path = _prepare_cache_path(job_id, model)
 
         stems_result = {}
