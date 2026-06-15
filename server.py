@@ -1483,7 +1483,12 @@ def _remember_cache_entry(job_id):
 
 
 def _initialize_cache_order():
-    """Seed the bounded cache queue from existing cache folders at startup."""
+    """Seed the bounded cache queue from existing cache folders at startup.
+
+    Returns the number of pre-existing cache entries pruned to honor the
+    limit, so startup can tell the operator when boot deleted cached stems
+    (e.g. after lowering SLOPSMITH_DEMUCS_CACHE_MAX_JOBS).
+    """
     cache_entries = []
     for path in CACHE_DIR.iterdir():
         if path.is_dir():
@@ -1495,6 +1500,8 @@ def _initialize_cache_order():
 
     for _, job_id in sorted(cache_entries):
         _remember_cache_entry(job_id)
+
+    return max(0, len(cache_entries) - len(cache_order))
 
 
 def _enqueue_job(job_id, audio_path, stem_list, model):
@@ -1762,13 +1769,16 @@ def main():
         _device = "cuda" if _gpu_available else "cpu"
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    _initialize_cache_order()
+    _pruned_at_startup = _initialize_cache_order()
 
     print(f"Slopsmith Demucs Server starting on {args.host}:{args.port}")
     print(f"  Model: {_model}")
     print(f"  Device: {_device} (GPU: {_gpu_available})")
     print(f"  Cache: {CACHE_DIR}")
     print(f"  Cache max completed jobs: {CACHE_MAX_COMPLETED_JOBS}")
+    if _pruned_at_startup > 0:
+        print(f"  Cache: pruned {_pruned_at_startup} "
+              f"entr{'y' if _pruned_at_startup == 1 else 'ies'} over the limit at startup")
     if API_KEY:
         print("  API key: enabled")
 
